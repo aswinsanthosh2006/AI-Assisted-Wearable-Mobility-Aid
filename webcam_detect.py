@@ -1,0 +1,441 @@
+import cv2
+import numpy as np
+import tflite_runtime.interpreter as tflite
+import os
+import time
+from collections import Counter
+import RPi.GPIO as GPIO
+
+# =========================================================
+#                 ULTRASONIC SENSOR SETUP
+# =========================================================
+
+TRIG = 23
+ECHO = 24
+
+GPIO.setmode(GPIO.BCM)
+
+GPIO.setup(TRIG, GPIO.OUT)
+GPIO.setup(ECHO, GPIO.IN)
+
+GPIO.output(TRIG, False)
+
+time.sleep(2)
+
+# =========================================================
+#                    SYSTEM SETTINGS
+# =========================================================
+
+FRAME_SKIP = 2
+
+CONFIDENCE_THRESHOLD = 0.6
+
+MIN_DETECTIONS = 3
+
+VOTING_WINDOW = 1.5
+
+COOLDOWN = 4
+
+CAMERA_WIDTH = 640
+CAMERA_HEIGHT = 480
+
+# =========================================================
+#                 ULTRASONIC DISTANCE
+# =========================================================
+
+def get_distance():
+    """
+    Trigger the HC-SR04 ultrasonic sensor and return the
+    measured distance in centimetres.
+
+    Returns 999 on timeout (no echo received within 30 ms).
+    """
+    GPIO.output(TRIG, True)
+    time.sleep(0.00001)
+    GPIO.output(TRIG, False)
+
+    pulse_start = time.time()
+    timeout = pulse_start
+
+    while GPIO.input(ECHO) == 0:
+        pulse_start = time.time()
+        if pulse_start - timeout > 0.03:
+            return 999
+
+    pulse_end = time.time()
+
+    while GPIO.input(ECHO) == 1:
+        pulse_end = time.time()
+        if pulse_end - pulse_start > 0.03:
+            return 999
+
+    duration = pulse_end - pulse_start
+    distance = duration * 17150
+
+    return round(distance, 2)
+
+# =========================================================
+#                    TEXT TO SPEECH
+# =========================================================
+
+def speak(text):
+    """
+    Synthesise text using espeak-ng and play via aplay.
+    Speech rate is set to 150 words per minute.
+    """
+    print("SPEAK:", text)
+    os.system(
+        f'espeak-ng -s 150 "{text}" > /tmp/tts.wav && aplay /tmp/tts.wav'
+    )
+
+# =========================================================
+#                        STARTUP
+# =========================================================
+
+speak("System ready")
+
+# =========================================================
+#                  LOAD TFLITE MODEL
+# =========================================================
+
+interpreter = tflite.Interpreter(
+    model_path="model/detect.tflite"
+)
+
+interpreter.allocate_tensors()
+
+input_details = interpreter.get_input_details()
+output_details = interpreter.get_output_details()
+
+# =========================================================
+#                    LOAD LABELS
+# =========================================================
+
+with open("model/labelmap.txt", "r") as f:
+    labels = [line.strip() for line in f.readlines()]
+
+# =========================================================
+#                        CAMERA
+# =========================================================
+
+cap = cv2.VideoCapture(0, cv2.CAP_V4L2)
+
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
+
+time.sleep(2)
+
+if not cap.isOpened():
+    print("Camera not accessible")
+    exit()
+
+# =========================================================
+#                  MODEL INPUT SIZE
+# =========================================================
+
+width = input_details[0]['shape'][2]
+height = input_details[0]['shape'][1]
+
+# =========================================================
+#                      VARIABLES
+# =========================================================
+
+frame_count = 0
+
+last_spoken = ""
+
+last_speak_time = 0
+
+detections_buffer = []
+
+vote_start_time = time.time()
+
+# =========================================================
+#                      MAIN LOOP
+# =========================================================
+
+try:
+
+    while True:
+
+        ret, frame = cap.read()
+
+        if not ret:
+            continue
+
+        frame_count += 1
+
+        # -------------------------------------------------
+        # FRAME SKIP
+        # -------------------------------------------------
+
+        if frame_count % FRAME_SKIP != 0:
+            continue
+
+        # -------------------------------------------------
+        # ULTRASONIC DISTANCE
+        # -------------------------------------------------
+
+        distance_cm = get_distance()
+
+        # -------------------------------------------------
+        # DISTANCE STATUS
+        # -------------------------------------------------
+
+        if distance_cm < 80:
+            distance_status = "near"
+        elif distance_cm < 200:
+            distance_status = "medium"
+        else:
+            distance_status = "far"
+
+        # -------------------------------------------------
+        # FRAME INFO
+        # -------------------------------------------------
+
+        imH, imW, _ = frame.shape
+
+        center_x = imW // 2
+
+        # -------------------------------------------------
+        # PREPROCESS
+        # -------------------------------------------------
+
+        frame_resized = cv2.resize(frame, (width, height))
+
+        input_data = np.expand_dims(frame_resized, axis=0)
+
+        # -------------------------------------------------
+        # RUN MODEL
+        # -------------------------------------------------
+
+        interpreter.set_tensor(
+            input_details[0]['index'],
+            input_data
+        )
+
+        interpreter.invoke()
+
+        boxes = interpreter.get_tensor(
+            output_details[0]['index']
+        )[0]
+
+        classes = interpreter.get_tensor(
+            output_details[1]['index']
+        )[0]
+
+        scores = interpreter.get_tensor(
+            output_details[2]['index']
+        )[0]
+
+        best_object = None
+        best_box = None
+        best_area = 0
+
+        # -------------------------------------------------
+        # DETECTION LOOP
+        # -------------------------------------------------
+
+        for i in range(len(scores)):
+
+            if scores[i] < CONFIDENCE_THRESHOLD:
+                continue
+
+            ymin = int(max(1, boxes[i][0] * imH))
+            xmin = int(max(1, boxes[i][1] * imW))
+            ymax = int(min(imH, boxes[i][2] * imH))
+            xmax = int(min(imW, boxes[i][3] * imW))
+
+            class_id = int(classes[i])
+
+            if class_id + 1 >= len(labels):
+                continue
+
+            object_name = labels[class_id + 1]
+
+            # -------------------------------------------------
+            # IGNORE BAD DETECTIONS
+            # -------------------------------------------------
+
+            ignored_objects = [
+                "suitcase"
+            ]
+
+            if object_name in ignored_objects:
+                continue
+
+            # -------------------------------------------------
+            # BOX AREA
+            # -------------------------------------------------
+
+            box_width = xmax - xmin
+            box_height = ymax - ymin
+
+            box_area = box_width * box_height
+
+            if box_area < 3000:
+                continue
+
+            # -------------------------------------------------
+            # CENTER FILTER
+            # -------------------------------------------------
+
+            margin = 120
+
+            if object_name != "person":
+                if not (xmin - margin < center_x < xmax + margin):
+                    continue
+
+            # -------------------------------------------------
+            # PERSON PRIORITY
+            # -------------------------------------------------
+
+            if object_name == "person":
+                box_area += 1000000
+
+            # -------------------------------------------------
+            # KEEP BIGGEST OBJECT
+            # -------------------------------------------------
+
+            if box_area > best_area:
+                best_area = box_area
+                best_object = object_name
+                best_box = (xmin, ymin, xmax, ymax)
+
+        # -------------------------------------------------
+        # STORE DETECTIONS
+        # -------------------------------------------------
+
+        if best_object is not None:
+
+            detections_buffer.append(best_object)
+
+            xmin, ymin, xmax, ymax = best_box
+
+            # -------------------------------------------------
+            # DRAW BOUNDING BOX
+            # -------------------------------------------------
+
+            cv2.rectangle(
+                frame,
+                (xmin, ymin),
+                (xmax, ymax),
+                (0, 255, 0),
+                2
+            )
+
+            label = f"{best_object} | {distance_status}"
+
+            cv2.putText(
+                frame,
+                label,
+                (xmin, ymin - 10),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (0, 255, 0),
+                2
+            )
+
+        # -------------------------------------------------
+        # VOTING SYSTEM
+        # -------------------------------------------------
+
+        current_time = time.time()
+
+        if current_time - vote_start_time >= VOTING_WINDOW:
+
+            if len(detections_buffer) >= MIN_DETECTIONS:
+
+                object_counter = Counter(detections_buffer)
+
+                most_common_object = (
+                    object_counter.most_common(1)[0][0]
+                )
+
+                object_count = (
+                    object_counter.most_common(1)[0][1]
+                )
+
+                # -------------------------------------------------
+                # STABLE DETECTION
+                # -------------------------------------------------
+
+                if object_count >= MIN_DETECTIONS:
+
+                    final_message = (
+                        f"{most_common_object} "
+                        f"{distance_status}"
+                    )
+
+                    print("FINAL:", final_message)
+
+                    # -------------------------------------------------
+                    # SPEAK WITH COOLDOWN
+                    # -------------------------------------------------
+
+                    if (
+                        final_message != last_spoken
+                        or
+                        current_time - last_speak_time > COOLDOWN
+                    ):
+
+                        # PERSON
+                        if most_common_object == "person":
+                            speak(f"Person {distance_status}")
+
+                        # VEHICLES
+                        elif most_common_object in [
+                            "car",
+                            "bus",
+                            "truck"
+                        ]:
+                            speak(f"Vehicle {distance_status}")
+
+                        # ANIMALS
+                        elif most_common_object in [
+                            "dog",
+                            "cat",
+                            "cow",
+                            "horse"
+                        ]:
+                            speak(f"Animal {distance_status}")
+
+                        else:
+                            speak(final_message)
+
+                        last_spoken = final_message
+
+                        last_speak_time = current_time
+
+            # -------------------------------------------------
+            # RESET BUFFER
+            # -------------------------------------------------
+
+            detections_buffer.clear()
+
+            vote_start_time = current_time
+
+        # -------------------------------------------------
+        # DISPLAY WINDOW
+        # -------------------------------------------------
+
+        cv2.imshow("AI Blind Assistant", frame)
+
+        # -------------------------------------------------
+        # EXIT
+        # -------------------------------------------------
+
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+except KeyboardInterrupt:
+
+    print("Stopping system")
+
+finally:
+
+    cap.release()
+
+    cv2.destroyAllWindows()
+
+    GPIO.cleanup()

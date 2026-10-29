@@ -1,0 +1,16 @@
+# AI-Assisted Wearable Mobility Aid — Raspberry Pi Dependencies
+# Install inside a virtual environment (see docs/software-setup.md).
+#
+# System packages required BEFORE pip install:
+#   sudo apt install python3-dev libatlas-base-dev espeak-ng alsa-utils
+#
+# RPi.GPIO is usually pre-installed on Raspberry Pi OS.
+# If absent: sudo apt install python3-rpi.gpio
+#
+# tflite-runtime wheel must match your Python version and architecture.
+# See docs/software-setup.md for the correct download URL.
+
+opencv-python==4.9.0.80
+numpy==1.26.4
+tflite-runtime==2.14.0
+RPi.GPIO==0.7.1
