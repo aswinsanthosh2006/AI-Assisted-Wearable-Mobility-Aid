@@ -73,3 +73,8 @@ secrets.h
 dist/
 build/
 *.egg-info/
+
+# Raw source images (use docs/images/ copies only)
+*.pptx
+WhatsApp Image*
+Screenshot*
